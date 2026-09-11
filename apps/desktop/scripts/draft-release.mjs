@@ -58,22 +58,42 @@ process.env.PATH = (process.env.PATH || "")
 run("npx", ["tauri", "build"]);
 
 // 2. collect artifacts: AppImage (linux) + NSIS setup.exe (windows)
-const bundleDir = join(root, "src-tauri", "target", "release", "bundle");
+// NOTE: in a Cargo workspace, `target/` lives at the workspace root, NOT
+// under src-tauri — so probe upward instead of assuming one location.
+const bundleDirs = [];
+{
+  let dir = root;
+  for (let depth = 0; depth < 4; depth++) {
+    for (const sub of ["src-tauri/target/release/bundle", "target/release/bundle"]) {
+      const candidate = join(dir, sub);
+      if (existsSync(candidate) && !bundleDirs.includes(candidate)) {
+        bundleDirs.push(candidate);
+      }
+    }
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+}
 const wanted = [];
-for (const sub of ["appimage", "nsis"]) {
-  const dir = join(bundleDir, sub);
-  if (!existsSync(dir)) continue;
-  for (const file of readdirSync(dir)) {
-    const lower = file.toLowerCase();
-    const isAppImage = sub === "appimage" && lower.endsWith(".appimage");
-    const isExe = sub === "nsis" && lower.endsWith("-setup.exe");
-    if ((isAppImage || isExe) && statSync(join(dir, file)).size > 0) {
-      wanted.push(join(dir, file));
+for (const bundleDir of bundleDirs) {
+  for (const sub of ["appimage", "nsis"]) {
+    const dir = join(bundleDir, sub);
+    if (!existsSync(dir)) continue;
+    for (const file of readdirSync(dir)) {
+      const lower = file.toLowerCase();
+      const isAppImage = sub === "appimage" && lower.endsWith(".appimage");
+      const isExe = sub === "nsis" && lower.endsWith("-setup.exe");
+      if ((isAppImage || isExe) && statSync(join(dir, file)).size > 0) {
+        wanted.push(join(dir, file));
+      }
     }
   }
 }
 if (wanted.length === 0) {
-  console.error(`ERROR: no AppImage/setup.exe found under ${bundleDir}. Build may have failed.`);
+  console.error(
+    `ERROR: no AppImage/setup.exe found under any of:\n - ${bundleDirs.join("\n - ") || "(no bundle dirs found)"}\nBuild may have failed.`,
+  );
   process.exit(1);
 }
 console.log("Artifacts:\n - " + wanted.join("\n - "));
