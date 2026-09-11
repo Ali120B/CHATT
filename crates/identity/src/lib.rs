@@ -156,9 +156,15 @@ impl FileStore {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        use std::os::unix::fs::OpenOptionsExt;
         let mut options = std::fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true).mode(0o600);
+        options.write(true).create(true).truncate(true);
+        // Unix: owner-only key file. Windows: %APPDATA%-style dirs are
+        // user-scoped by default ACLs, and the OS keyring is tried first.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
         use std::io::Write;
         options.open(&self.path)?.write_all(&identity.encode())?;
         Ok(())

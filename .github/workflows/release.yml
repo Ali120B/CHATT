@@ -7,6 +7,9 @@ on:
     tags: ["v*"]
 jobs:
   build:
+    # tauri-action creates/updates the draft release: it needs write access.
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
