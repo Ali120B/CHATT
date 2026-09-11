@@ -12,4 +12,4 @@ jobs:
       - run: cargo test --workspace
       - run: npm --prefix apps/desktop install
       - run: npm --prefix apps/desktop run check
-      - run: npm --prefix apps/desktop run build
+      - run: npm --prefix apps/desktop run build:ui

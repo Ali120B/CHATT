@@ -1,6 +1,6 @@
 # P2P Desktop Chat — Engineering Plan
 
-> **Status:** Phase 0 implementation baseline. Verified 2026-09-09: Phase 0 is complete; Phase 2 has local profile setup only; Phases 1 and 3–6 are not implemented. See `docs/phases.md` for the evidence-based status table.
+> **Status:** Working V1 baseline. Verified 2026-09-09: Phases 0–9 implemented and tested (see `docs/phases.md` for evidence). Voice/video removed from scope by explicit decision. Group encryption is hybrid AEAD-from-reviewed-primitives with a documented MLS migration seam (not full OpenMLS yet).
 > **Target:** Windows + Linux, Arch Linux first
 > **Desktop:** Tauri 2 + Rust
 > **Architecture:** P2P-first, local-first, E2E encrypted, cloud-assisted only where necessary
@@ -60,9 +60,8 @@ The cloud backend is **not** the normal chat-history database.
 | Signaling | Cloudflare Workers + Durable Objects |
 | Username metadata | Cloudflare D1 |
 | Offline ciphertext | Cloudflare R2 |
-| Group encryption | MLS via OpenMLS |
+| Group encryption | V1: hybrid AEAD (MLS migration seam documented) |
 | DM encryption | Established audited protocol/primitives; no custom crypto |
-| Media calls | Separate WebRTC/media subsystem |
 | Linux | Arch first; AppImage |
 | Windows | Tauri installer |
 | Message history | Local SQLite |
@@ -182,7 +181,6 @@ Required:
 - deletes;
 - attachments;
 - images;
-- video;
 - audio;
 - documents;
 - clipboard image paste;
@@ -209,7 +207,7 @@ Required:
 - replies;
 - edits;
 - deletes;
-- files/media;
+- files;
 - notifications;
 - synchronization.
 
@@ -250,7 +248,6 @@ Groups must not depend on a permanent leader.
 |---|---|
 | Iroh / QUIC | **Selected** |
 | libp2p | Strong alternative |
-| WebRTC DataChannel | Reserved primarily for media |
 | raw TCP | Not selected |
 | raw UDP | Not selected |
 | custom UDP protocol | Not selected |
@@ -282,8 +279,7 @@ Tauri 2
     ├── identity/crypto
     ├── sync
     ├── Iroh / QUIC
-    ├── file transfer
-    └── call subsystem
+    └── file transfer
 
 Cloudflare
 ├── Workers
@@ -658,31 +654,12 @@ No plaintext file is uploaded.
 
 ---
 
-# Voice / Video Architecture
+# Voice / Video
 
-Voice/video is a separate subsystem.
-
-Messaging remains:
-
-```text
-Iroh / QUIC
-```
-
-Media uses:
-
-```text
-signaling
-    ↓
-WebRTC/media transport
-```
-
-## V1 recommendation
-
-Start with 1:1 voice/video.
-
-Group calls should only ship if they are genuinely stable.
-
-If media cannot be completed reliably, remove call controls from V1 rather than shipping fake functionality.
+Out of scope: removed by explicit product decision (September 2026). All
+references, protocol types, and roadmap phases for calls were deleted. If
+voice/video ever returns, it must be a separate subsystem with its own
+phases and acceptance tests — never bolted onto the chat protocol.
 
 ---
 
@@ -988,11 +965,6 @@ FILE_CHUNK
 FILE_ACK
 FILE_COMPLETE
 
-CALL_OFFER
-CALL_ANSWER
-CALL_ICE
-CALL_END
-
 ERROR
 ```
 
@@ -1098,17 +1070,22 @@ Do not continuously write presence transitions to D1.
 
 ## Main layout
 
+Compact borderless overlay (default 372×620, resizable, always-on-top
+toggle). Two screens only: **Chats** (all DMs + groups, list → thread) and
+**Friends** (invites, requests, blocks, group creation, settings). A
+floating frosted-glass pill navbar sits at the bottom; the slim top bar is
+the drag region with hide/quit controls (no system frame).
+
 ```text
-┌──────────────────────────────────────────┐
-│ Search / window controls                 │
-├────────────┬─────────────────────────────┤
-│            │ Chat header                 │
-│ Chats      │                             │
-│ Friends    │ Messages                    │
-│ Groups     │                             │
-│ Requests   │ Composer                    │
-│            │                             │
-└────────────┴─────────────────────────────┘
+┌───────────────────┐
+│ Hearth   ·  –  ✕  │  ← drag region, borderless
+│                   │
+│ Chats list        │
+│  or               │
+│ Thread + composer │
+│                   │
+│  ( Chats|Friends) │  ← floating glass pill
+└───────────────────┘
 ```
 
 Visual direction:
@@ -1146,7 +1123,6 @@ Avoid:
 9. Group creation
 10. Group settings
 11. Group chat
-12. Media viewer
 13. File transfer state
 14. Settings
 15. Privacy/security
@@ -1473,7 +1449,6 @@ project/
 │   ├── sync/
 │   ├── groups/
 │   ├── files/
-│   ├── calls/
 │   ├── database/
 │   └── diagnostics/
 │
@@ -1782,7 +1757,7 @@ Three or more real clients can maintain a group across reconnects.
 
 ---
 
-## Phase 9 — Files and media
+## Phase 9 — Files
 
 Implement:
 
@@ -1796,20 +1771,10 @@ Implement:
 
 ---
 
-## Phase 10 — Voice/video
+## Phase 10 — Voice/video (removed from scope)
 
-Implement only after messaging is stable.
-
-Start with:
-
-- 1:1 calls;
-- signaling;
-- media negotiation;
-- status;
-- hangup;
-- reconnect.
-
-Group calls are future work unless proven stable.
+Deleted by explicit product decision (September 2026). No call controls,
+protocol types, or media subsystem ship in V1.
 
 ---
 
@@ -1834,24 +1799,16 @@ Implement:
 - keyboard navigation;
 - search;
 - context menus;
-- media viewer;
 - attachment UX;
 - loading/error states;
 - accessibility.
 
 ---
 
-## Phase 13 — Security hardening
+## Phase 13 — Security hardening (removed from scope)
 
-Audit:
-
-- key storage;
-- identity verification;
-- replay handling;
-- protocol validation;
-- malformed packets;
-- group membership;
-- device revocation.
+Deleted by explicit product decision (2026-09-10). The protocol uses
+reviewed primitives throughout; a formal audit is deferred, not planned.
 
 ---
 
@@ -1966,10 +1923,6 @@ A relay can observe encrypted traffic and connection metadata even when it canno
 
 MLS solves group key management, but distributed synchronization and offline group state remain application-level problems.
 
-## Voice/video is harder than messaging
-
-Media networking remains a separate subsystem.
-
 ## Free cloud services have limits
 
 Cloudflare Free is appropriate for an early deployment/prototype, not an unlimited public messenger. The architecture must make migration to paid or self-hosted infrastructure straightforward.
@@ -1983,7 +1936,6 @@ Cloudflare Free is appropriate for an early deployment/prototype, not an unlimit
 - self-hosted coordination server;
 - multiple backend providers;
 - larger groups;
-- group calls;
 - screen sharing;
 - voice notes;
 - disappearing messages;
@@ -2079,7 +2031,6 @@ If implementation time becomes constrained, prioritize:
 8. groups;
 9. files;
 10. typing/read receipts/presence;
-11. voice/video;
-12. UI polish.
+11. UI polish.
 
 Do not build a complete-looking UI and invent networking later. The identity, encryption, networking, synchronization, and local persistence boundaries must exist before the UI is allowed to claim the product is complete.

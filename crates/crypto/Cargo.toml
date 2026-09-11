@@ -1,12 +1,15 @@
 [package]
-name = "chat-protocol"
+name = "chat-crypto"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
+aead06 = { version = "0.6", package = "aead" }
 anyhow.workspace = true
+chacha20poly1305 = "0.11.0"
+crypto_box = "0.9.1"
+rand = "0.10.2"
 serde.workspace = true
-serde_json.workspace = true
+sha2 = "0.11.0"
 thiserror.workspace = true
-uuid.workspace = true

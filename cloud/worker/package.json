@@ -1,0 +1,14 @@
+{
+  "name": "hearth-coordinator",
+  "private": true,
+  "version": "1.0.0",
+  "scripts": {
+    "check": "tsc --noEmit",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250620.0",
+    "typescript": "^5.9.0",
+    "wrangler": "^4.0.0"
+  }
+}

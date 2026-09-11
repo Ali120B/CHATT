@@ -14,13 +14,13 @@ Hearth is **local-first + P2P-first + end-to-end encrypted + cloud-assisted**. �
 | Control plane | discovery, signaling, device metadata | No message plaintext |
 | Object mailbox | short-lived encrypted bundles/files | No |
 
-The first implementation intentionally exposes no connectivity, encryption, or delivery claims. It persists the local onboarding profile and includes a clearly labelled, disposable test-mode workspace for reviewing UI navigation. Test mode uses frontend-only sample content; it does not create identity material, persist messages, or contact a service.
+The client persists the local onboarding profile in SQLite and exposes only implemented capabilities: every chat, friend, group, and file control is backed by the real transport, encryption, and sync layers described below.
 
 ## Dependency direction
 
 `desktop → app-core → database` and `desktop → protocol`.
 
-The protocol crate owns versioned, transport-neutral envelopes. The database crate owns schema and SQL. The app-core crate owns user-facing state transitions. Networking, identity/crypto, synchronization, groups, files, and calls will be separate crates so they cannot leak transport or storage concerns upward.
+The protocol crate owns versioned, transport-neutral envelopes. The database crate owns schema and SQL. The app-core crate owns user-facing state transitions. Identity, crypto, transport, coordination, groups, and files are separate crates so they cannot leak transport or storage concerns upward. (Voice/video was removed from scope; no calls crate ships.)
 
 ## Protocol rule
 
@@ -32,10 +32,10 @@ SQLite uses WAL and foreign keys. Migrations create the initial `profiles`, `con
 
 ## Future integration seams
 
-1. Identity keys and secure OS key storage.
-2. Iroh endpoint and connection state machine (direct, relay, offline).
-3. Authenticated DM session and outbound queue worker.
-4. Cloudflare discovery/signaling plus encrypted mailbox.
-5. Friends, MLS groups, file transfer, then media.
+1. Identity keys and secure OS key storage (done: `chat-identity`).
+2. Iroh endpoint and connection state machine — direct, relay, offline (done: `chat-transport`).
+3. Authenticated DM session and outbound queue worker (done: `chat-app-core` + shell workers).
+4. Cloudflare discovery/signaling plus encrypted mailbox (done: `chat-coordinator` + `cloud/worker`; local mode needs no account).
+5. Friends, V1 hybrid group encryption (MLS migration seam documented), file transfer (done).
 
 See the detailed design and non-negotiable constraints in [`../plan.md`](../plan.md).

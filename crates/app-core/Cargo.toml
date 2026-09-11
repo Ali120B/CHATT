@@ -6,4 +6,13 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+chat-coordinator = { version = "1.0.0", path = "../coordinator" }
+chat-crypto = { version = "1.0.0", path = "../crypto" }
 chat-database = { path = "../database" }
+chat-identity = { version = "1.0.0", path = "../identity" }
+chat-protocol = { version = "1.0.0", path = "../protocol" }
+chat-transport = { version = "1.0.0", path = "../transport" }
+serde.workspace = true
+serde_json.workspace = true
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros"] }
+uuid.workspace = true

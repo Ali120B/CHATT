@@ -1,12 +1,16 @@
 [package]
-name = "chat-protocol"
+name = "chat-identity"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+base64 = "0.23.1"
+chat-crypto = { version = "1.0.0", path = "../crypto" }
+ed25519-dalek = "3.0.0"
+keyring = "4.2.0"
+rand = "0.10.2"
 serde.workspace = true
-serde_json.workspace = true
 thiserror.workspace = true
 uuid.workspace = true

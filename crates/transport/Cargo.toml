@@ -1,0 +1,19 @@
+[package]
+name = "chat-transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+chat-protocol = { path = "../protocol" }
+iroh = "1.1.0"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "sync", "io-util"] }
+base64 = "0.23.1"
+serde_json.workspace = true
+
+[dev-dependencies]
+chat-crypto = { path = "../crypto" }

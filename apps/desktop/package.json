@@ -1,9 +1,25 @@
 {
   "name": "chat-desktop",
   "private": true,
-  "version": "0.1.0",
+  "version": "1.0.0",
   "type": "module",
-  "scripts": { "dev": "vite", "build": "tsc && vite build", "check": "tsc --noEmit", "tauri": "tauri" },
-  "dependencies": { "@tauri-apps/api": "^2.9.0" },
-  "devDependencies": { "@tauri-apps/cli": "^2.9.0", "typescript": "^5.9.0", "vite": "^7.1.0" }
+  "scripts": {
+    "dev": "vite",
+    "build:ui": "tsc && vite build",
+    "build": "npm run build:ui && node scripts/draft-release.mjs",
+    "check": "tsc --noEmit",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.9.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.9.0",
+    "typescript": "^5.9.0",
+    "vite": "^7.1.0"
+  },
+  "author": {
+    "name": "Ali120B",
+    "email": "alibashmail2010@yahoo.com"
+  }
 }

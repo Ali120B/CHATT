@@ -10,5 +10,16 @@ tauri-build = { version = "2.5", features = [] }
 [dependencies]
 chat-app-core = { path = "../../../crates/app-core" }
 chat-database = { path = "../../../crates/database" }
-tauri = { version = "2.9", features = [] }
+tauri = { version = "2.9", features = ["tray-icon"] }
 serde = { workspace = true, features = ["derive"] }
+tauri-plugin-global-shortcut = "2.3.2"
+tauri-plugin-notification = "2.4.0"
+tauri-plugin-single-instance = "2.4.4"
+anyhow.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "sync", "io-util"] }
+chat-identity = { version = "1.0.0", path = "../../../crates/identity" }
+chat-coordinator = { version = "1.0.0", path = "../../../crates/coordinator" }
+chat-transport = { version = "1.0.0", path = "../../../crates/transport" }
+chat-protocol = { version = "1.0.0", path = "../../../crates/protocol" }

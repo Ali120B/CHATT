@@ -5,7 +5,9 @@
 ```bash
 npm --prefix apps/desktop install
 npm --prefix apps/desktop run check
-npm --prefix apps/desktop run build
+npm --prefix apps/desktop run build:ui
+# Full installer + GitHub draft release (needs `gh auth login`):
+# npm --prefix apps/desktop run build
 cargo fmt --all -- --check
 cargo test --workspace
 ```
