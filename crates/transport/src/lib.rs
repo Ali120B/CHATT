@@ -277,6 +277,44 @@ impl Transport {
         }
     }
 
+    /// A cheap clone of the endpoint handle. Send on the clone so the
+    /// app-level transport lock is never held across network I/O.
+    pub fn endpoint_handle(&self) -> Endpoint {
+        self.endpoint.clone()
+    }
+
+    /// Record the outcome of a send performed on an [`endpoint_handle`].
+    /// Takes the same result `send_envelope` would have produced.
+    pub fn finish_send(
+        &self,
+        peer: EndpointId,
+        result: Result<SendDetail>,
+    ) -> Result<TransportDiagnostics> {
+        match result {
+            Ok(detail) => {
+                let state = if detail.via_relay {
+                    ConnectionState::RelayConnected
+                } else {
+                    ConnectionState::DirectConnected
+                };
+                self.set_peer(peer, |p| {
+                    p.state = state;
+                    p.last_error = None;
+                });
+                Ok(self.peer_diagnostics(peer, state, detail.note, None))
+            }
+            Err(e) => {
+                let message = format!("{e:#}");
+                self.set_peer(peer, |p| {
+                    p.state = ConnectionState::Offline;
+                    p.reconnect_count += 1;
+                    p.last_error = Some(message.clone());
+                });
+                Err(anyhow::anyhow!("send to {peer} failed: {message}"))
+            }
+        }
+    }
+
     /// Send one envelope and wait for the stream ack. Updates peer state and
     /// returns fresh diagnostics for the peer.
     pub async fn send_envelope(
@@ -289,73 +327,8 @@ impl Transport {
             p.state = ConnectionState::Negotiating;
             p.last_error = None;
         });
-        let result = self.send_once(addr, envelope).await;
-        match result {
-            Ok(detail) => {
-                let state = if detail.via_relay {
-                    ConnectionState::RelayConnected
-                } else {
-                    ConnectionState::DirectConnected
-                };
-                self.set_peer(addr.id, |p| {
-                    p.state = state;
-                    p.last_error = None;
-                });
-                Ok(self.peer_diagnostics(addr.id, state, detail.note, None))
-            }
-            Err(e) => {
-                let message = format!("{e:#}");
-                self.set_peer(addr.id, |p| {
-                    p.state = ConnectionState::Offline;
-                    p.reconnect_count += 1;
-                    p.last_error = Some(message.clone());
-                });
-                Err(anyhow::anyhow!("send to {} failed: {message}", addr.id))
-            }
-        }
-    }
-
-    async fn send_once(
-        &self,
-        addr: &EndpointAddr,
-        envelope: &ProtocolEnvelope,
-    ) -> Result<SendDetail> {
-        let connection = tokio::time::timeout(
-            Duration::from_secs(20),
-            self.endpoint.connect(addr.clone(), HEARTH_ALPN),
-        )
-        .await
-        .context("connect timed out")?
-        .context("connect failed")?;
-        let via_relay = path_is_relay(&connection);
-        let (mut send, mut recv) =
-            tokio::time::timeout(Duration::from_secs(10), connection.open_bi())
-                .await
-                .context("open stream timed out")?
-                .context("open stream failed")?;
-        let frame = envelope.encode_frame()?;
-        tokio::time::timeout(Duration::from_secs(30), send.write_all(&frame))
-            .await
-            .context("write timed out")?
-            .context("write failed")?;
-        send.finish().context("finish stream")?;
-        let ack_bytes = tokio::time::timeout(
-            Duration::from_secs(30),
-            recv.read_to_end(MAX_ENVELOPE_BYTES),
-        )
-        .await
-        .context("ack timed out")?
-        .context("read ack failed")?;
-        let ack: StreamAck = decode_json_frame(&ack_bytes)?;
-        if ack.message_id != envelope.message_id {
-            anyhow::bail!("ack referenced wrong message");
-        }
-        let note = if via_relay {
-            "relayed path".to_string()
-        } else {
-            "direct path".to_string()
-        };
-        Ok(SendDetail { via_relay, note })
+        let result = send_via(&self.endpoint, addr, envelope).await;
+        self.finish_send(addr.id, result)
     }
 
     fn peer_diagnostics(
@@ -380,9 +353,70 @@ impl Transport {
     }
 }
 
-struct SendDetail {
-    via_relay: bool,
-    note: String,
+#[derive(Debug, Clone)]
+pub struct SendDetail {
+    pub via_relay: bool,
+    pub note: String,
+}
+
+/// Send one envelope over an endpoint handle and wait for the stream ack.
+/// Overall budget is 60s no matter how the per-phase timeouts stack up, so a
+/// half-open connection can never stall a sender (or a shared send lock)
+/// indefinitely.
+pub async fn send_via(
+    endpoint: &Endpoint,
+    addr: &EndpointAddr,
+    envelope: &ProtocolEnvelope,
+) -> Result<SendDetail> {
+    envelope.validate()?;
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        send_once_inner(endpoint, addr, envelope),
+    )
+    .await
+    .context("send timed out")?
+}
+
+async fn send_once_inner(
+    endpoint: &Endpoint,
+    addr: &EndpointAddr,
+    envelope: &ProtocolEnvelope,
+) -> Result<SendDetail> {
+    let connection = tokio::time::timeout(
+        Duration::from_secs(20),
+        endpoint.connect(addr.clone(), HEARTH_ALPN),
+    )
+    .await
+    .context("connect timed out")?
+    .context("connect failed")?;
+    let via_relay = path_is_relay(&connection);
+    let (mut send, mut recv) = tokio::time::timeout(Duration::from_secs(10), connection.open_bi())
+        .await
+        .context("open stream timed out")?
+        .context("open stream failed")?;
+    let frame = envelope.encode_frame()?;
+    tokio::time::timeout(Duration::from_secs(30), send.write_all(&frame))
+        .await
+        .context("write timed out")?
+        .context("write failed")?;
+    send.finish().context("finish stream")?;
+    let ack_bytes = tokio::time::timeout(
+        Duration::from_secs(30),
+        recv.read_to_end(MAX_ENVELOPE_BYTES),
+    )
+    .await
+    .context("ack timed out")?
+    .context("read ack failed")?;
+    let ack: StreamAck = decode_json_frame(&ack_bytes)?;
+    if ack.message_id != envelope.message_id {
+        anyhow::bail!("ack referenced wrong message");
+    }
+    let note = if via_relay {
+        "relayed path".to_string()
+    } else {
+        "direct path".to_string()
+    };
+    Ok(SendDetail { via_relay, note })
 }
 
 fn path_is_relay(connection: &Connection) -> bool {

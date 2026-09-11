@@ -28,6 +28,7 @@ type ChatDetail = { conversation: ChatSummary; messages: ChatMessage[]; files: F
 type FriendEntry = { username: string; displayName: string; status: string; seen: boolean };
 type FriendRequest = { id: string; direction: string; peerUsername: string; peerDisplayName: string; status: string };
 type FriendsView = { contacts: FriendEntry[]; incoming: FriendRequest[]; outgoing: FriendRequest[] };
+type ImportResult = { username: string; delivered: boolean; surfaced: number };
 type PeerPresence = { username: string; status: string; label: string; fresh: boolean };
 type PresenceView = { status: string; label: string; peers: PeerPresence[] };
 type Tab = "chats" | "friends";
@@ -40,6 +41,7 @@ let detail: ChatDetail | null = null;
 let friends: FriendsView | null = null;
 let toast: string | null = null;
 let toastTimer: number | undefined;
+let addingFriend = false;
 let presence: PresenceView | null = null;
 let searchOpen = false;
 let searchQuery = "";
@@ -379,7 +381,8 @@ function friendsScreen() {
     <div class="fsection">
       <label class="rowlabel">My invite code</label>
       <div class="inline"><input id="my-invite" readonly placeholder="loading…" /><button id="copy-invite" type="button">Copy</button></div>
-      <form id="import-form" class="inline"><input name="code" placeholder="Paste friend's invite…" /><button>Add</button></form>
+      <form id="import-form" class="inline"><input name="code" placeholder="Paste friend's invite…" /><button id="add-btn" ${addingFriend ? "disabled" : ""}>${addingFriend ? "Adding…" : "Add"}</button></form>
+      <small class="muted">Both ways: they need your code, and you need theirs. Asks send automatically when you're both online.</small>
     </div>
     ${incoming ? `<div class="fsection"><label class="rowlabel">Requests</label>${incoming}</div>` : ""}
     ${outgoing ? `<div class="fsection"><label class="rowlabel">Sent</label>${outgoing}</div>` : ""}
@@ -637,13 +640,24 @@ function bind() {
   });
   document.querySelector<HTMLFormElement>("#import-form")?.addEventListener("submit", async (e) => {
     e.preventDefault();
+    if (addingFriend) return;
     const code = new FormData(e.currentTarget as HTMLFormElement).get("code");
+    addingFriend = true;
+    render();
     try {
-      const username = await invoke<string>("import_invite", { code });
-      showToast(`Ask sent to @${username}.`);
+      const res = await invoke<ImportResult>("import_invite", { code });
+      if (res.surfaced > 0) {
+        showToast(`@${res.username} added — ${res.surfaced} waiting request${res.surfaced === 1 ? "" : "s"} opened!`);
+      } else if (res.delivered) {
+        showToast(`Ask sent to @${res.username}.`);
+      } else {
+        showToast(`Saved @${res.username} — ask queued, sends automatically when they're reachable.`);
+      }
       newGroupMembers.clear();
       await loadAll();
     } catch (err) { showToast(String(err)); }
+    addingFriend = false;
+    render();
   });
   document.querySelectorAll<HTMLElement>("[data-dm]").forEach((b) =>
     b.addEventListener("click", async () => {
@@ -654,7 +668,11 @@ function bind() {
     }));
   document.querySelectorAll<HTMLElement>("[data-ask]").forEach((b) =>
     b.addEventListener("click", async () => {
-      try { await invoke("send_friend_request", { username: b.dataset.ask }); await loadAll(); }
+      try {
+        const delivered = await invoke<boolean>("send_friend_request", { username: b.dataset.ask });
+        showToast(delivered ? "Ask sent." : "Peer unreachable — ask queued, retries automatically.");
+        await loadAll();
+      }
       catch (e) { showToast(String(e)); }
     }));
   document.querySelectorAll<HTMLElement>("[data-accept]").forEach((b) =>

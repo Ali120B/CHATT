@@ -690,7 +690,7 @@ dependencies = [
 
 [[package]]
 name = "chat-app-core"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "chat-coordinator",
@@ -707,7 +707,7 @@ dependencies = [
 
 [[package]]
 name = "chat-coordinator"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "reqwest",
@@ -720,7 +720,7 @@ dependencies = [
 
 [[package]]
 name = "chat-crypto"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
  "aead 0.6.1",
  "anyhow",
@@ -734,7 +734,7 @@ dependencies = [
 
 [[package]]
 name = "chat-database"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "rusqlite",
@@ -743,7 +743,7 @@ dependencies = [
 
 [[package]]
 name = "chat-desktop"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "chat-app-core",
@@ -765,7 +765,7 @@ dependencies = [
 
 [[package]]
 name = "chat-identity"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -780,7 +780,7 @@ dependencies = [
 
 [[package]]
 name = "chat-protocol"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -791,7 +791,7 @@ dependencies = [
 
 [[package]]
 name = "chat-transport"
-version = "1.0.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",

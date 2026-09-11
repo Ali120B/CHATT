@@ -19,7 +19,7 @@ anyhow.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "sync", "io-util"] }
-chat-identity = { version = "1.0.0", path = "../../../crates/identity" }
-chat-coordinator = { version = "1.0.0", path = "../../../crates/coordinator" }
-chat-transport = { version = "1.0.0", path = "../../../crates/transport" }
-chat-protocol = { version = "1.0.0", path = "../../../crates/protocol" }
+chat-identity = { version = "1.2.0", path = "../../../crates/identity" }
+chat-coordinator = { version = "1.2.0", path = "../../../crates/coordinator" }
+chat-transport = { version = "1.2.0", path = "../../../crates/transport" }
+chat-protocol = { version = "1.2.0", path = "../../../crates/protocol" }

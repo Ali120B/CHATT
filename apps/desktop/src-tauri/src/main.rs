@@ -410,11 +410,22 @@ async fn exec_outbound(
         cache.insert(target.id.to_string(), target.clone());
     }
     let diagnostics = {
+        // Clone the endpoint handle under a brief lock, then release it:
+        // network I/O must never hold the shared transport mutex, or one
+        // slow peer stalls every other sender (and every status check).
+        let handle = {
+            let guard = state.transport.lock().await;
+            guard
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("transport unavailable"))?
+                .endpoint_handle()
+        };
+        let result = chat_transport::send_via(&handle, &target, envelope).await;
         let guard = state.transport.lock().await;
-        let transport = guard
+        guard
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("transport unavailable"))?;
-        transport.send_envelope(&target, envelope).await?
+            .ok_or_else(|| anyhow::anyhow!("transport unavailable"))?
+            .finish_send(target.id, result)?
     };
     if let Ok(db) = state.db.lock() {
         let _ = db.dequeue_pending_for(message_id, peer_username);
@@ -566,7 +577,219 @@ fn note_endpoint(db: &Database, username: &str, endpoint_id: &str, now: i64) {
 struct RouteOutcome {
     works: Vec<OutboundWork>,
     notify: Option<(String, String)>,
+    /// In-app toast, shown even when the window is focused (unlike `notify`,
+    /// which only fires OS notifications when unfocused).
+    toast: Option<String>,
     changed: bool,
+}
+
+/// Open a handshake frame with a contact's keys, enforcing that the sealed
+/// sender name matches the contact it verified against.
+fn open_handshake(
+    state: &AppState,
+    me: &str,
+    contact: &Contact,
+    envelope: &ProtocolEnvelope,
+) -> anyhow::Result<ChatPayload> {
+    let peer_x = contact_x_pub(contact).ok_or_else(|| anyhow::anyhow!("no key"))?;
+    let context = match envelope.message_type {
+        MessageType::FriendRequest => format!("friend-ask:{}>{me}", contact.username),
+        MessageType::FriendResponse => format!("friend-answer:{}>{me}", contact.username),
+        _ => anyhow::bail!("not a handshake frame"),
+    };
+    let payload =
+        app_friends::open_friend_payload(&state.identity, &peer_x, &context, &envelope.ciphertext)?;
+    if payload.sender() != contact.username {
+        anyhow::bail!("handshake sender mismatch");
+    }
+    Ok(payload)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_friend_ask(
+    state: &AppState,
+    db: &Database,
+    me: &str,
+    from: &str,
+    contact: &Contact,
+    envelope: &ProtocolEnvelope,
+    from_endpoint: &str,
+    now: i64,
+    outcome: &mut RouteOutcome,
+) -> anyhow::Result<()> {
+    let _ = me;
+    let payload = open_handshake(state, me, contact, envelope)?;
+    let ChatPayload::FriendAsk {
+        endpoint_bundle, ..
+    } = &payload
+    else {
+        anyhow::bail!("not a friend ask")
+    };
+    let row = app_friends::receive_friend_ask(db, &payload, now)?;
+    if !endpoint_bundle.is_empty()
+        && let Some(mut contact) = db.find_contact(from)?
+    {
+        contact.endpoint_bundle = Some(endpoint_bundle.clone());
+        db.upsert_contact(&contact, now)?;
+    }
+    note_endpoint(db, from, from_endpoint, now);
+    outcome.notify = Some((
+        "Friend request".to_string(),
+        format!("@{from} wants to chat"),
+    ));
+    outcome.changed = true;
+    let _ = row;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_friend_answer(
+    state: &AppState,
+    db: &Database,
+    me: &str,
+    from: &str,
+    contact: &Contact,
+    envelope: &ProtocolEnvelope,
+    from_endpoint: &str,
+    now: i64,
+    outcome: &mut RouteOutcome,
+) -> anyhow::Result<()> {
+    let _ = me;
+    let payload = open_handshake(state, me, contact, envelope)?;
+    if let ChatPayload::FriendAnswer {
+        accepted,
+        endpoint_bundle,
+        ..
+    } = payload
+    {
+        if accepted {
+            app_friends::receive_friend_answer(db, from, true, &endpoint_bundle, now)?;
+            note_endpoint(db, from, from_endpoint, now);
+            outcome.notify = Some((
+                "Friend added".to_string(),
+                format!("@{from} accepted your request"),
+            ));
+        } else {
+            app_friends::receive_friend_answer(db, from, false, "", now)?;
+            outcome.notify = Some(("Request declined".to_string(), format!("@{from} declined")));
+        }
+        outcome.changed = true;
+    }
+    Ok(())
+}
+
+/// Keep a handshake envelope we cannot open yet (unknown sender). It is
+/// trial-opened after the matching invite is imported, so exchanging codes
+/// in either order works. Bounded by message id + 7-day TTL.
+fn stash_unknown(
+    _state: &AppState,
+    db: &Database,
+    envelope: &ProtocolEnvelope,
+    from_endpoint: &str,
+    now: i64,
+    outcome: &mut RouteOutcome,
+) -> anyhow::Result<()> {
+    let json = serde_json::to_string(envelope)?;
+    db.stash_envelope(
+        &envelope.message_id.to_string(),
+        from_endpoint,
+        &json,
+        now,
+        now + MAILBOX_TTL_MS,
+    )?;
+    outcome.toast = Some(
+        "Got a friend request from an unknown device — paste their invite code to read it."
+            .to_string(),
+    );
+    outcome.changed = true;
+    Ok(())
+}
+
+/// After importing `username`'s invite, trial-open stashed envelopes with
+/// their key and route whatever authenticates. Returns surfaced requests.
+fn drain_stash_for(state: &AppState, username: &str) -> usize {
+    let now = now_ms();
+    let db = match state.db.lock() {
+        Ok(db) => db,
+        Err(_) => return 0,
+    };
+    let me = my_username(state).unwrap_or_default();
+    if me.is_empty() {
+        return 0;
+    }
+    let contact = match db.find_contact(username) {
+        Ok(Some(contact)) => contact,
+        _ => return 0,
+    };
+    if contact_x_pub(&contact).is_none() {
+        return 0;
+    }
+    let stashed = db.list_stash(now).unwrap_or_default();
+    if stashed.is_empty() {
+        return 0;
+    }
+    let mut surfaced = 0;
+    for item in stashed {
+        let parsed: Result<ProtocolEnvelope, _> = serde_json::from_str(&item.envelope_json);
+        let routed = (|| -> anyhow::Result<bool> {
+            let envelope = parsed?;
+            // Trial against ONLY the new contact: cheap and precise.
+            let mut ed = [0u8; 32];
+            let ed_bytes = contact
+                .ed_pubkey
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("no ed key"))?;
+            if ed_bytes.len() != 32 {
+                anyhow::bail!("bad ed key");
+            }
+            ed.copy_from_slice(ed_bytes);
+            chat_app_core::verify_envelope_signature(&ed, &envelope)?;
+            let mut outcome = RouteOutcome {
+                works: Vec::new(),
+                notify: None,
+                toast: None,
+                changed: false,
+            };
+            match envelope.message_type {
+                MessageType::FriendRequest => {
+                    handle_friend_ask(
+                        state,
+                        &db,
+                        &me,
+                        username,
+                        &contact,
+                        &envelope,
+                        &item.endpoint_id,
+                        now,
+                        &mut outcome,
+                    )?;
+                }
+                MessageType::FriendResponse => {
+                    handle_friend_answer(
+                        state,
+                        &db,
+                        &me,
+                        username,
+                        &contact,
+                        &envelope,
+                        &item.endpoint_id,
+                        now,
+                        &mut outcome,
+                    )?;
+                }
+                _ => anyhow::bail!("not stashed handshake"),
+            }
+            if outcome.changed {
+                surfaced += 1;
+            }
+            Ok(true)
+        })();
+        // Authenticated (or provably not ours): never retry the same bytes.
+        if routed.is_ok() {
+            let _ = db.unstash(&item.message_id);
+        }
+    }
+    surfaced
 }
 
 fn route_inbound(state: &AppState, inbound: &InboundEnvelope) -> anyhow::Result<RouteOutcome> {
@@ -576,6 +799,7 @@ fn route_inbound(state: &AppState, inbound: &InboundEnvelope) -> anyhow::Result<
     let mut outcome = RouteOutcome {
         works: Vec::new(),
         notify: None,
+        toast: None,
         changed: false,
     };
     let db = state
@@ -587,74 +811,55 @@ fn route_inbound(state: &AppState, inbound: &InboundEnvelope) -> anyhow::Result<
         .map(|(username, _)| username)
         .unwrap_or_default();
 
-    // -- Friend handshake frames (trust-on-first-use over imported invites) --
+    // -- Friend handshake frames. Known senders open immediately; unknown
+    // senders stash undecrypted until their invite is imported (drain on
+    // import trial-opens with the new keys). Either order of exchanging
+    // invite codes works.
     if envelope.message_type == MessageType::FriendRequest {
-        let (from, _ed) = identify_sender(&db, envelope, &from_endpoint).ok_or_else(|| {
-            anyhow::anyhow!("friend request from unknown device — import their invite first")
-        })?;
-        let contact = db
-            .find_contact(&from)?
-            .ok_or_else(|| anyhow::anyhow!("unknown contact"))?;
-        let peer_x = contact_x_pub(&contact).ok_or_else(|| anyhow::anyhow!("no key"))?;
-        let context = format!("friend-ask:{from}>{me}");
-        let payload = app_friends::open_friend_payload(
-            &state.identity,
-            &peer_x,
-            &context,
-            &envelope.ciphertext,
-        )?;
-        let row = app_friends::receive_friend_ask(&db, &payload, now)?;
-        if let ChatPayload::FriendAsk {
-            endpoint_bundle, ..
-        } = &payload
-            && !endpoint_bundle.is_empty()
-            && let Some(mut contact) = db.find_contact(&from)?
-        {
-            contact.endpoint_bundle = Some(endpoint_bundle.clone());
-            db.upsert_contact(&contact, now)?;
+        match identify_sender(&db, envelope, &from_endpoint) {
+            Some((from, _)) => {
+                let contact = db
+                    .find_contact(&from)?
+                    .ok_or_else(|| anyhow::anyhow!("unknown contact"))?;
+                handle_friend_ask(
+                    state,
+                    &db,
+                    &me,
+                    &from,
+                    &contact,
+                    envelope,
+                    &from_endpoint,
+                    now,
+                    &mut outcome,
+                )?;
+            }
+            None => {
+                stash_unknown(state, &db, envelope, &from_endpoint, now, &mut outcome)?;
+            }
         }
-        note_endpoint(&db, &from, &from_endpoint, now);
-        outcome.notify = Some((
-            "Friend request".to_string(),
-            format!("@{from} wants to chat"),
-        ));
-        outcome.changed = true;
-        let _ = row;
         return Ok(outcome);
     }
     if envelope.message_type == MessageType::FriendResponse {
-        let (from, _) = identify_sender(&db, envelope, &from_endpoint)
-            .ok_or_else(|| anyhow::anyhow!("answer from unknown device"))?;
-        let contact = db
-            .find_contact(&from)?
-            .ok_or_else(|| anyhow::anyhow!("unknown contact"))?;
-        let peer_x = contact_x_pub(&contact).ok_or_else(|| anyhow::anyhow!("no key"))?;
-        let context = format!("friend-answer:{from}>{me}");
-        let payload = app_friends::open_friend_payload(
-            &state.identity,
-            &peer_x,
-            &context,
-            &envelope.ciphertext,
-        )?;
-        if let ChatPayload::FriendAnswer {
-            accepted,
-            endpoint_bundle,
-            ..
-        } = payload
-        {
-            if accepted {
-                app_friends::receive_friend_answer(&db, &from, true, &endpoint_bundle, now)?;
-                note_endpoint(&db, &from, &from_endpoint, now);
-                outcome.notify = Some((
-                    "Friend added".to_string(),
-                    format!("@{from} accepted your request"),
-                ));
-            } else {
-                app_friends::receive_friend_answer(&db, &from, false, "", now)?;
-                outcome.notify =
-                    Some(("Request declined".to_string(), format!("@{from} declined")));
+        match identify_sender(&db, envelope, &from_endpoint) {
+            Some((from, _)) => {
+                let contact = db
+                    .find_contact(&from)?
+                    .ok_or_else(|| anyhow::anyhow!("unknown contact"))?;
+                handle_friend_answer(
+                    state,
+                    &db,
+                    &me,
+                    &from,
+                    &contact,
+                    envelope,
+                    &from_endpoint,
+                    now,
+                    &mut outcome,
+                )?;
             }
-            outcome.changed = true;
+            None => {
+                stash_unknown(state, &db, envelope, &from_endpoint, now, &mut outcome)?;
+            }
         }
         return Ok(outcome);
     }
@@ -2055,7 +2260,7 @@ fn my_invite(app: AppHandle) -> Result<String, String> {
 }
 
 #[tauri::command]
-async fn import_invite(app: AppHandle, code: String) -> Result<String, String> {
+async fn import_invite(app: AppHandle, code: String) -> Result<ImportResult, String> {
     let state: tauri::State<AppState> = app.state();
     let username = {
         let db = state.db.lock().map_err(|e| e.to_string())?;
@@ -2063,12 +2268,41 @@ async fn import_invite(app: AppHandle, code: String) -> Result<String, String> {
             app_friends::import_invite(&db, code.trim(), now_ms()).map_err(|e| e.to_string())?;
         invite.username.clone()
     };
-    let _ = send_friend_request_inner(&app, &username).await;
+    let delivered = send_friend_request_inner(&app, &username)
+        .await
+        .unwrap_or(false);
+    // Their earlier asks/answers (arrived before we had their keys) surface now.
+    let surfaced = drain_stash_for(&state, &username);
     emit_refresh(&app);
-    Ok(username)
+    Ok(ImportResult {
+        username,
+        delivered,
+        surfaced,
+    })
 }
 
-async fn send_friend_request_inner(app: &AppHandle, peer_username: &str) -> Result<(), String> {
+/// Queue a handshake envelope for background retry (survives restarts and
+/// offline peers). Call after a failed direct send.
+fn queue_handshake(state: &AppState, peer_username: &str, envelope: &ProtocolEnvelope) {
+    let json = serde_json::to_string(envelope).unwrap_or_default();
+    if json.is_empty() {
+        return;
+    }
+    let next = now_ms() + app_sync::retry_delay_ms(0);
+    if let Ok(db) = state.db.lock() {
+        let _ = db.enqueue_handshake(&envelope.message_id.to_string(), peer_username, &json, next);
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ImportResult {
+    username: String,
+    delivered: bool,
+    surfaced: usize,
+}
+
+async fn send_friend_request_inner(app: &AppHandle, peer_username: &str) -> Result<bool, String> {
     let state: tauri::State<AppState> = app.state();
     let now = now_ms();
     let work = {
@@ -2093,10 +2327,11 @@ async fn send_friend_request_inner(app: &AppHandle, peer_username: &str) -> Resu
     // Best effort: shared queue backup for offline recipients.
     let _ = publish_ask_to_queue(&state, &peer).await;
     match exec_outbound(&state, &peer, &work.envelope, &id).await {
-        Ok(_) => Ok(()),
-        Err(e) => {
-            // Direct failed: leave the sealed ask in the shared mailbox when
-            // one is configured so it survives our own shutdown too.
+        Ok(_) => Ok(true),
+        Err(_) => {
+            // Not delivered: retry in background + shared mailbox when one is
+            // configured, so it survives our own shutdown too.
+            queue_handshake(&state, &peer, &work.envelope);
             if cloud_worker_url(&state).is_some() {
                 let object = MailboxObject {
                     id: Uuid::new_v4().to_string(),
@@ -2108,16 +2343,16 @@ async fn send_friend_request_inner(app: &AppHandle, peer_username: &str) -> Resu
                     let _ = coord.mailbox_put(&peer, &object).await;
                 }
             }
-            Err(e.to_string())
+            Ok(false)
         }
     }
 }
 
 #[tauri::command]
-async fn send_friend_request(app: AppHandle, username: String) -> Result<(), String> {
-    send_friend_request_inner(&app, username.trim()).await?;
+async fn send_friend_request(app: AppHandle, username: String) -> Result<bool, String> {
+    let delivered = send_friend_request_inner(&app, username.trim()).await?;
     emit_refresh(&app);
-    Ok(())
+    Ok(delivered)
 }
 
 #[tauri::command]
@@ -2143,16 +2378,18 @@ async fn accept_request(app: AppHandle, request_id: String) -> Result<String, St
     if exec_outbound(&state, &work.peer_username, &work.envelope, &id)
         .await
         .is_err()
-        && cloud_worker_url(&state).is_some()
     {
-        let object = MailboxObject {
-            id: Uuid::new_v4().to_string(),
-            envelope_json: serde_json::to_string(&work.envelope).unwrap_or_default(),
-            created_at_ms: now_ms(),
-            expires_at_ms: now_ms() + MAILBOX_TTL_MS,
-        };
-        if let Ok(coord) = coordinator_for(&state) {
-            let _ = coord.mailbox_put(&work.peer_username, &object).await;
+        queue_handshake(&state, &work.peer_username, &work.envelope);
+        if cloud_worker_url(&state).is_some() {
+            let object = MailboxObject {
+                id: Uuid::new_v4().to_string(),
+                envelope_json: serde_json::to_string(&work.envelope).unwrap_or_default(),
+                created_at_ms: now_ms(),
+                expires_at_ms: now_ms() + MAILBOX_TTL_MS,
+            };
+            if let Ok(coord) = coordinator_for(&state) {
+                let _ = coord.mailbox_put(&work.peer_username, &object).await;
+            }
         }
     }
     emit_refresh(&app);
@@ -2836,6 +3073,9 @@ fn run_routed(app: &AppHandle, inbound: &InboundEnvelope) -> anyhow::Result<()> 
     if let Some((title, body)) = outcome.notify {
         notify(app, &title, &body);
     }
+    if let Some(text) = outcome.toast {
+        let _ = app.emit("hearth://toast", text);
+    }
     if outcome.changed {
         emit_refresh(app);
     }
@@ -2918,6 +3158,38 @@ async fn retry_worker(app: AppHandle) {
                 Err(_) => {
                     if let Ok(db) = state.db.lock() {
                         let _ = db.dequeue_pending_for(&item.message_id, &item.peer_id);
+                    }
+                }
+            }
+        }
+        // Handshake retries (friend asks/answers): envelope bytes are stored
+        // with the row, no message row needed.
+        let due_handshakes = state
+            .db
+            .lock()
+            .ok()
+            .map(|db| db.list_due_handshakes(now, 20).unwrap_or_default())
+            .unwrap_or_default();
+        for item in due_handshakes {
+            let parsed: Result<ProtocolEnvelope, _> = serde_json::from_str(&item.envelope_json);
+            match parsed {
+                Ok(envelope) => {
+                    if exec_outbound(&state, &item.peer_username, &envelope, &item.message_id)
+                        .await
+                        .is_ok()
+                    {
+                        if let Ok(db) = state.db.lock() {
+                            let _ = db.dequeue_handshake(&item.message_id);
+                        }
+                        emit_refresh(&app);
+                    } else if let Ok(db) = state.db.lock() {
+                        let delay = app_sync::retry_delay_ms(item.attempt_count as u32);
+                        let _ = db.backoff_handshake(&item.message_id, now + delay);
+                    }
+                }
+                Err(_) => {
+                    if let Ok(db) = state.db.lock() {
+                        let _ = db.dequeue_handshake(&item.message_id);
                     }
                 }
             }

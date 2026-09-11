@@ -7,7 +7,7 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 base64 = "0.23.1"
-chat-crypto = { version = "1.0.0", path = "../crypto" }
+chat-crypto = { version = "1.2.0", path = "../crypto" }
 ed25519-dalek = "3.0.0"
 keyring = "4.2.0"
 rand = "0.10.2"

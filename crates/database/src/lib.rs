@@ -109,6 +109,24 @@ pub type StoredGroupKeyWrap = (Vec<u8>, Option<Vec<u8>>);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct PendingHandshake {
+    pub message_id: String,
+    pub peer_username: String,
+    pub envelope_json: String,
+    pub attempt_count: i64,
+    pub next_attempt_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StashedEnvelope {
+    pub message_id: String,
+    pub endpoint_id: String,
+    pub envelope_json: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PendingItem {
     pub id: String,
     pub message_id: String,
@@ -213,6 +231,24 @@ impl Database {
                 attempt_count INTEGER NOT NULL DEFAULT 0,
                 next_attempt_at_ms INTEGER NOT NULL,
                 state TEXT NOT NULL
+            );
+            -- Handshake envelopes (friend asks/answers) are not message rows, so
+            -- they cannot use pending_outbound's message FK. Same retry shape.
+            CREATE TABLE IF NOT EXISTS pending_handshakes (
+                message_id TEXT PRIMARY KEY,
+                peer_username TEXT NOT NULL,
+                envelope_json TEXT NOT NULL,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at_ms INTEGER NOT NULL
+            );
+            -- Handshake envelopes from unknown devices: kept undecrypted until
+            -- the matching invite is imported, then trial-opened and routed.
+            CREATE TABLE IF NOT EXISTS stashed_envelopes (
+                message_id TEXT PRIMARY KEY,
+                endpoint_id TEXT NOT NULL,
+                envelope_json TEXT NOT NULL,
+                received_at_ms INTEGER NOT NULL,
+                expires_at_ms INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS sync_cursors (
                 peer_id TEXT NOT NULL,
@@ -804,6 +840,111 @@ impl Database {
         Ok(())
     }
 
+    // -- handshake retry queue ---------------------------------------------
+    pub fn enqueue_handshake(
+        &self,
+        message_id: &str,
+        peer_username: &str,
+        envelope_json: &str,
+        next_attempt_at_ms: i64,
+    ) -> Result<()> {
+        self.connection.execute(
+            "INSERT INTO pending_handshakes (message_id, peer_username, envelope_json, attempt_count, next_attempt_at_ms)
+             VALUES (?1, ?2, ?3, 0, ?4)
+             ON CONFLICT(message_id) DO UPDATE SET next_attempt_at_ms = excluded.next_attempt_at_ms",
+            params![message_id, peer_username, envelope_json, next_attempt_at_ms],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_due_handshakes(&self, now_ms: i64, limit: i64) -> Result<Vec<PendingHandshake>> {
+        let mut stmt = self.connection.prepare(
+            "SELECT message_id, peer_username, envelope_json, attempt_count, next_attempt_at_ms
+             FROM pending_handshakes WHERE next_attempt_at_ms <= ?1
+             ORDER BY next_attempt_at_ms ASC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![now_ms, limit], |row| {
+            Ok(PendingHandshake {
+                message_id: row.get(0)?,
+                peer_username: row.get(1)?,
+                envelope_json: row.get(2)?,
+                attempt_count: row.get(3)?,
+                next_attempt_at_ms: row.get(4)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .context("due handshakes")
+    }
+
+    pub fn backoff_handshake(&self, message_id: &str, next_attempt_at_ms: i64) -> Result<()> {
+        self.connection.execute(
+            "UPDATE pending_handshakes SET attempt_count = attempt_count + 1, next_attempt_at_ms = ?1 WHERE message_id = ?2",
+            params![next_attempt_at_ms, message_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn dequeue_handshake(&self, message_id: &str) -> Result<()> {
+        self.connection.execute(
+            "DELETE FROM pending_handshakes WHERE message_id = ?1",
+            params![message_id],
+        )?;
+        Ok(())
+    }
+
+    // -- unknown-sender stash ----------------------------------------------
+    /// Stash an undecryptable handshake envelope. Dedupes by message id so
+    /// mailbox redelivery never piles up copies.
+    pub fn stash_envelope(
+        &self,
+        message_id: &str,
+        endpoint_id: &str,
+        envelope_json: &str,
+        now_ms: i64,
+        expires_at_ms: i64,
+    ) -> Result<bool> {
+        let inserted = self.connection.execute(
+            "INSERT OR IGNORE INTO stashed_envelopes (message_id, endpoint_id, envelope_json, received_at_ms, expires_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![message_id, endpoint_id, envelope_json, now_ms, expires_at_ms],
+        )? > 0;
+        // Bounded: keep the newest 200 so a spammer cannot grow this table.
+        self.connection.execute(
+            "DELETE FROM stashed_envelopes WHERE message_id NOT IN
+             (SELECT message_id FROM stashed_envelopes ORDER BY received_at_ms DESC LIMIT 200)",
+            [],
+        )?;
+        Ok(inserted)
+    }
+
+    /// Non-expired stashed envelopes, oldest first. Prunes the expired.
+    pub fn list_stash(&self, now_ms: i64) -> Result<Vec<StashedEnvelope>> {
+        self.connection.execute(
+            "DELETE FROM stashed_envelopes WHERE expires_at_ms <= ?1",
+            params![now_ms],
+        )?;
+        let mut stmt = self.connection.prepare(
+            "SELECT message_id, endpoint_id, envelope_json FROM stashed_envelopes ORDER BY received_at_ms ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(StashedEnvelope {
+                message_id: row.get(0)?,
+                endpoint_id: row.get(1)?,
+                envelope_json: row.get(2)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .context("list stash")
+    }
+
+    pub fn unstash(&self, message_id: &str) -> Result<()> {
+        self.connection.execute(
+            "DELETE FROM stashed_envelopes WHERE message_id = ?1",
+            params![message_id],
+        )?;
+        Ok(())
+    }
+
     // -- sync cursors ------------------------------------------------------
     pub fn update_sync_cursor(
         &self,
@@ -1309,6 +1450,36 @@ mod tests {
             db.get_setting("coordinator").unwrap(),
             Some("local".to_string())
         );
+    }
+
+    #[test]
+    fn handshake_queue_roundtrip_with_backoff() {
+        let db = Database::in_memory().unwrap();
+        assert!(db.list_due_handshakes(100, 10).unwrap().is_empty());
+        db.enqueue_handshake("m-1", "bob", "{\"a\":1}", 10).unwrap();
+        // Re-enqueue keeps a single row per message.
+        db.enqueue_handshake("m-1", "bob", "{\"a\":1}", 12).unwrap();
+        assert!(db.list_due_handshakes(11, 10).unwrap().is_empty());
+        assert_eq!(db.list_due_handshakes(12, 10).unwrap().len(), 1);
+        db.backoff_handshake("m-1", 99).unwrap();
+        let due = db.list_due_handshakes(99, 10).unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].attempt_count, 1);
+        db.dequeue_handshake("m-1").unwrap();
+        assert!(db.list_due_handshakes(100, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn stash_dedupes_and_expires() {
+        let db = Database::in_memory().unwrap();
+        assert!(db.stash_envelope("m-1", "node-x", "{}", 10, 100).unwrap());
+        assert!(!db.stash_envelope("m-1", "node-x", "{}", 11, 100).unwrap());
+        db.stash_envelope("m-old", "node-x", "{}", 10, 20).unwrap();
+        let live = db.list_stash(50).unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].message_id, "m-1");
+        db.unstash("m-1").unwrap();
+        assert!(db.list_stash(50).unwrap().is_empty());
     }
 
     #[test]

@@ -1,4 +1,4 @@
-# Hearth v1.0.0 (draft)
+# Hearth (draft release notes)
 
 Local-first, P2P-first encrypted chat overlay for desktop — a Roblox-chat replacement that floats on top of your game.
 
